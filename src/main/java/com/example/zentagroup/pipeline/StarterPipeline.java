@@ -17,17 +17,27 @@
  */
 package com.example.zentagroup.pipeline;
 
+import static org.apache.beam.sdk.io.gcp.bigquery.BigQueryIO.Write.CreateDisposition.CREATE_IF_NEEDED;
+
 import org.apache.beam.sdk.Pipeline;
+import org.apache.beam.sdk.io.TextIO;
+import org.apache.beam.sdk.io.gcp.bigquery.BigQueryIO;
 import org.apache.beam.sdk.options.PipelineOptionsFactory;
-import org.apache.beam.sdk.transforms.Create;
-import org.apache.beam.sdk.transforms.DoFn;
-import org.apache.beam.sdk.transforms.MapElements;
-import org.apache.beam.sdk.transforms.ParDo;
-import org.apache.beam.sdk.transforms.SimpleFunction;
+import org.apache.beam.sdk.transforms.Count;
+import org.apache.beam.sdk.transforms.Filter;
+import org.apache.beam.sdk.transforms.Top;
+import org.apache.beam.sdk.values.KV;
+import org.apache.beam.sdk.values.PCollection;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.example.zentagroup.options.ExamplePipelineOptions;
+import com.example.zentagroup.schema.CountByCity;
+import com.example.zentagroup.transform.AirbnbToKVByCityTransform;
+import com.example.zentagroup.transform.PlacebyCityToBigQueryTransform;
+import com.example.zentagroup.transform.PlacebyCityToStringMostTransform;
+import com.example.zentagroup.transform.StringToAirbnbTransform;
+import com.example.zentagroup.utils.Constants;
 
 /**
  * A starter example for writing Beam programs.
@@ -50,24 +60,38 @@ public class StarterPipeline {
 	private static final Logger LOG = LoggerFactory.getLogger(StarterPipeline.class);
 
 	public static void main(String[] args) {
-		
+		LOG.info(Constants.START_PIPELINE);
+
 		ExamplePipelineOptions options = PipelineOptionsFactory.fromArgs(args).withValidation()
 				.as(ExamplePipelineOptions.class);
 
 		Pipeline p = Pipeline.create(options);
 
-		p.apply(Create.of("Hello", "World")).apply(MapElements.via(new SimpleFunction<String, String>() {
-			@Override
-			public String apply(String input) {
-				return input.toUpperCase();
-			}
-		})).apply(ParDo.of(new DoFn<String, Void>() {
-			@ProcessElement
-			public void processElement(ProcessContext c) {
-				LOG.info(c.element());
-			}
-		}));
+		PCollection<KV<String, Long>> placesByCity = p
+				.apply(Constants.READ_CSV, TextIO.read().from(options.getInputFile()))
+				.apply(Constants.REMOVE_HEADER,
+						Filter.by((String row) -> !((row.startsWith("dwid") || row.startsWith("\"dwid\"")
+								|| row.startsWith("id")))))
+				.apply(Constants.STRING_TO_AIRBNB, new StringToAirbnbTransform())
+				.apply(Constants.TRANSFORM_KV_CITY, new AirbnbToKVByCityTransform())
+				.apply(Constants.COUNT_BY_CITY, Count.perKey());
 
-		p.run();
+		placesByCity
+				.apply(Constants.MOST + Constants.NUMBER_RANK,
+						Top.<KV<String, Long>, KV.OrderByValue<String, Long>>of(Constants.NUMBER_RANK,
+								new KV.OrderByValue<String, Long>()).withoutDefaults())
+				.apply(Constants.MOST + Constants.PLACEBYCITY_TO_STRING, new PlacebyCityToStringMostTransform())
+				.apply(Constants.WRITE_OUTPUT, TextIO.write().to(options.getOutputBestFile())
+						.withSuffix(Constants.EXTENSION_CSV).withoutSharding());
+
+		placesByCity.apply(Constants.PLACEBYCITY_TO_STRING, new PlacebyCityToBigQueryTransform()).apply(
+				Constants.PLACEBYCITY_TO_BQ,
+				BigQueryIO.writeTableRows().to(options.getOutputBigQueryTable())
+						.withSchema(CountByCity.getTableSchema()).withCreateDisposition(CREATE_IF_NEEDED)
+						.withWriteDisposition(BigQueryIO.Write.WriteDisposition.WRITE_APPEND).withoutValidation());
+
+		p.run().waitUntilFinish();
+
+		LOG.info(Constants.END_PIPELINE);
 	}
 }
